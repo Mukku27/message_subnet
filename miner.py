@@ -3,40 +3,74 @@ import time
 import argparse
 import traceback
 import bittensor as bt
-from typing import Tuple
+import pandas as pd
+import numpy as np
+import uuid
+import base64
+import io
+import soundfile as sf
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Optional
+import threading
+import torch
+import asyncio
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-from protocol import Dummy
+from protocol import STTSynapse
 
-
-class Miner:
+class STTMiner:
     def __init__(self):
         self.config = self.get_config()
         self.setup_logging()
         self.setup_bittensor_objects()
+        self.setup_job_database()
+        self.setup_whisper_model()
+        
+        # Miner state
+        self.my_subnet_uid = self.metagraph.hotkeys.index(
+            self.wallet.hotkey.ss58_address
+        )
+        
+        # Job management
+        self.job_lock = threading.Lock()
 
     def get_config(self):
-        # Set up the configuration parser
         parser = argparse.ArgumentParser()
-        # TODO: Add your custom miner arguments to the parser.
+        
+        # Add STT-specific arguments
         parser.add_argument(
-            "--custom",
-            default="my_custom_value",
-            help="Adds a custom value to the parser.",
+            "--miner.csv_path", 
+            type=str, 
+            default="./miner_jobs.csv",
+            help="Path to store the miner jobs CSV"
         )
-        # Adds override arguments for network and netuid.
+        parser.add_argument(
+            "--miner.whisper_model", 
+            type=str, 
+            default="openai/whisper-base",
+            help="Whisper model to use for transcription"
+        )
+        parser.add_argument(
+            "--miner.device", 
+            type=str, 
+            default="cuda" if torch.cuda.is_available() else "cpu",
+            help="Device to run the model on (cuda/cpu)"
+        )
+        
+        # Network and subnet arguments
         parser.add_argument(
             "--netuid", type=int, default=1, help="The chain subnet uid."
         )
-        # Adds subtensor specific arguments.
+        
+        # Add standard Bittensor arguments
         bt.subtensor.add_args(parser)
-        # Adds logging specific arguments.
         bt.logging.add_args(parser)
-        # Adds wallet specific arguments.
         bt.wallet.add_args(parser)
-        # Adds axon specific arguments.
         bt.axon.add_args(parser)
-        # Parse the arguments.
+        
+        # Parse the config
         config = bt.config(parser)
+        
         # Set up logging directory
         config.full_path = os.path.expanduser(
             "{}/{}/{}/netuid{}/{}".format(
@@ -47,121 +81,191 @@ class Miner:
                 "miner",
             )
         )
-        # Ensure the directory for logging exists.
         os.makedirs(config.full_path, exist_ok=True)
         return config
 
     def setup_logging(self):
-        # Activate Bittensor's logging with the set configurations.
         bt.logging(config=self.config, logging_dir=self.config.full_path)
         bt.logging.info(
-            f"Running miner for subnet: {self.config.netuid} on network: {self.config.subtensor.network} with config:"
+            f"Running STT miner for subnet: {self.config.netuid} on network: {self.config.subtensor.network}"
         )
         bt.logging.info(self.config)
 
     def setup_bittensor_objects(self):
-        # Initialize Bittensor miner objects
-        bt.logging.info("Setting up Bittensor objects.")
-
-        # Initialize wallet.
+        bt.logging.info("Setting up Bittensor objects")
+        
+        # Initialize wallet
         self.wallet = bt.wallet(config=self.config)
         bt.logging.info(f"Wallet: {self.wallet}")
-
-        # Initialize subtensor.
+        
+        # Initialize subtensor
         self.subtensor = bt.subtensor(config=self.config)
         bt.logging.info(f"Subtensor: {self.subtensor}")
-
-        # Initialize metagraph.
+        
+        # Initialize metagraph
         self.metagraph = self.subtensor.metagraph(self.config.netuid)
         bt.logging.info(f"Metagraph: {self.metagraph}")
-
+        
+        # Verify miner is registered
         if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
             bt.logging.error(
-                f"\nYour miner: {self.wallet} is not registered to chain connection: {self.subtensor} \nRun 'btcli register' and try again."
+                f"Your miner: {self.wallet} is not registered to chain connection: {self.subtensor} \n"
+                f"Run 'btcli register' and try again."
             )
             exit()
         else:
-            # Each miner gets a unique identity (UID) in the network.
             self.my_subnet_uid = self.metagraph.hotkeys.index(
                 self.wallet.hotkey.ss58_address
             )
             bt.logging.info(f"Running miner on uid: {self.my_subnet_uid}")
 
-    def blacklist_fn(self, synapse: Dummy) -> Tuple[bool, str]:
-        # Ignore requests from unrecognized entities.
-        if synapse.dendrite.hotkey not in self.metagraph.hotkeys:
-            bt.logging.trace(
-                f"Blacklisting unrecognized hotkey {synapse.dendrite.hotkey}"
-            )
-            return True, None
-        bt.logging.trace(
-            f"Not blacklisting recognized hotkey {synapse.dendrite.hotkey}"
-        )
-        return False, None
-
-    def dummy(self, synapse: Dummy) -> Dummy:
-        # Check if the message is "hi" and respond with "hi this miner"
-        if synapse.message == "hi":
-            synapse.response = "hi this miner"
-        else:
-            synapse.response = "unknown message"
+    def setup_job_database(self):
+        csv_path = self.config.miner.csv_path
         
-        bt.logging.info(
-            f"Received message: {synapse.message}, sending response: {synapse.response}"
-        )
-        return synapse
+        # Create or load the CSV file
+        if os.path.exists(csv_path):
+            self.jobs_df = pd.read_csv(csv_path)
+            bt.logging.info(f"Loaded existing job database with {len(self.jobs_df)} entries")
+        else:
+            # Create a new DataFrame with the required columns
+            self.jobs_df = pd.DataFrame(columns=[
+                'job_id', 'job_status', 'job_accuracy', 'base64_audio', 
+                'transcript_miner', 'gender', 'created_at', 'normalized_text',
+                'language_miner', 'gender_miner', 'gender_confidence_miner'
+            ])
+            bt.logging.info("Created new job database")
+            
+        # Save the initial state
+        self.save_jobs_df()
 
-    def setup_axon(self):
-        # Build and link miner functions to the axon.
-        self.axon = bt.axon(wallet=self.wallet, config=self.config)
+    def setup_whisper_model(self):
+        """Initialize the Whisper model for speech recognition"""
+        bt.logging.info(f"Loading Whisper model: {self.config.miner.whisper_model}")
+        try:
+            self.processor = WhisperProcessor.from_pretrained(self.config.miner.whisper_model)
+            self.model = WhisperForConditionalGeneration.from_pretrained(self.config.miner.whisper_model)
+            
+            # Move model to the specified device
+            self.model.to(self.config.miner.device)
+            
+            bt.logging.info(f"Whisper model loaded successfully on {self.config.miner.device}")
+        except Exception as e:
+            bt.logging.error(f"Failed to load Whisper model: {e}")
+            traceback.print_exc()
+            exit(1)
 
-        # Attach functions to the axon.
-        bt.logging.info("Attaching forward function to axon.")
-        self.axon.attach(
-            forward_fn=self.dummy,
-            blacklist_fn=self.blacklist_fn,
-        )
+    def save_jobs_df(self):
+        """Save the jobs DataFrame to CSV"""
+        with self.job_lock:
+            self.jobs_df.to_csv(self.config.miner.csv_path, index=False)
+            bt.logging.debug(f"Saved job database with {len(self.jobs_df)} entries")
 
-        # Serve the axon.
-        bt.logging.info(
-            f"Serving axon on network: {self.config.subtensor.network} with netuid: {self.config.netuid}"
-        )
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-        bt.logging.info(f"Axon: {self.axon}")
+    def add_job(self, job_id: str, base64_audio: str, gender: Optional[str] = None):
+        """Add a new job to the database"""
+        with self.job_lock:
+            # Check if job already exists
+            if job_id in self.jobs_df['job_id'].values:
+                bt.logging.warning(f"Job {job_id} already exists in database")
+                return
+            
+            # Create a new job entry
+            job = {
+                'job_id': job_id,
+                'job_status': 'not_done',
+                'job_accuracy': None,
+                'base64_audio': base64_audio,
+                'transcript_miner': None,
+                'gender': gender,
+                'created_at': datetime.now().isoformat(),
+                'normalized_text': None,  # Miners don't have ground truth
+                'language_miner': None,
+                'gender_miner': None,
+                'gender_confidence_miner': None
+            }
+            
+            # Add to DataFrame
+            self.jobs_df = pd.concat([self.jobs_df, pd.DataFrame([job])], ignore_index=True)
+            self.save_jobs_df()
+            bt.logging.info(f"Added job {job_id} to database")
 
-        # Start the axon server.
-        bt.logging.info(f"Starting axon server on port: {self.config.axon.port}")
-        self.axon.start()
+    def update_job(self, job_id: str, transcript: str, language: str, gender: str, gender_confidence: float):
+        """Update a job with transcription results"""
+        with self.job_lock:
+            job_idx = self.jobs_df[self.jobs_df['job_id'] == job_id].index
+            
+            if len(job_idx) == 0:
+                bt.logging.warning(f"Job {job_id} not found in database")
+                return
+            
+            # Update job fields
+            self.jobs_df.loc[job_idx, 'job_status'] = 'done'
+            self.jobs_df.loc[job_idx, 'transcript_miner'] = transcript
+            self.jobs_df.loc[job_idx, 'language_miner'] = language
+            self.jobs_df.loc[job_idx, 'gender_miner'] = gender
+            self.jobs_df.loc[job_idx, 'gender_confidence_miner'] = gender_confidence
+            
+            # Save changes
+            self.save_jobs_df()
+            bt.logging.info(f"Updated job {job_id} with transcription results")
+
+    def transcribe_audio(self, base64_audio: str) -> Dict[str, Any]:
+        """Transcribe audio using Whisper model"""
+        try:
+            # Decode base64 audio
+            audio_bytes = base64.b64decode(base64_audio)
+            audio_io = io.BytesIO(audio_bytes)
+            
+            # Load audio file
+            audio_array, sample_rate = sf.read(audio_io)
+            
+            # Ensure audio is in the correct format for Whisper (mono, float32)
+            if len(audio_array.shape) > 1:
+                audio_array = audio_array.mean(axis=1)  # Convert to mono
+            
+            # Process with Whisper
+            input_features = self.processor(
+                audio_array, 
+                sampling_rate=sample_rate, 
+                return_tensors="pt"
+            ).input_features.to(self.config.miner.device)
+            
+            # Generate transcription
+            with torch.no_grad():
+                predicted_ids = self.model.generate(input_features)
+            
+            # Decode the predicted IDs to text
+            transcription = self.processor.batch_decode(
+                predicted_ids, 
+                skip_special_tokens=True
+            )[0]
+            
+            # For this example, we'll use simple placeholders for language and gender detection
+            # In a real implementation, you would use dedicated models for these tasks
+            language = "en"  # Placeholder
+            gender = "unknown"  # Placeholder
+            gender_confidence = 0.5  # Placeholder
+            
+            return {
+                'transcript': transcription,
+                'language': language,
+                'gender': gender,
+                'gender_confidence': gender_confidence
+            }
+            
+        except Exception as e:
+            bt.logging.error(f"Error transcribing audio: {e}")
+            traceback.print_exc()
+            return {
+                'transcript': None,
+                'language': None,
+                'gender': None,
+                'gender_confidence': None
+            }
 
     def run(self):
-        self.setup_axon()
+        # Implementation of the run method
+        pass
 
-        # Keep the miner alive.
-        bt.logging.info(f"Starting main loop")
-        step = 0
-        while True:
-            try:
-                # Periodically update our knowledge of the network graph.
-                if step % 60 == 0:
-                    self.metagraph.sync()
-                    log = (
-                        f"Block: {self.metagraph.block.item()} | "
-                        f"Incentive: {self.metagraph.I[self.my_subnet_uid]} | "
-                    )
-                    bt.logging.info(log)
-                step += 1
-                time.sleep(1)
-
-            except KeyboardInterrupt:
-                self.axon.stop()
-                bt.logging.success("Miner killed by keyboard interrupt.")
-                break
-            except Exception as e:
-                bt.logging.error(traceback.format_exc())
-                continue
-
-
-# Run the miner.
 if __name__ == "__main__":
-    miner = Miner()
+    miner = STTMiner()
     miner.run()
