@@ -264,8 +264,84 @@ class STTMiner:
             }
 
     def run(self):
-        # Implementation of the run method
-        pass
+        """Main miner loop"""
+        bt.logging.info("Starting miner loop")
+        
+        # Create and start the axon server
+        axon = bt.axon(wallet=self.wallet, config=self.config)
+        
+        # Attach the STT processing function to the axon
+        axon.attach(
+            forward_fn=self.process_stt_request,
+            blacklist_fn=None,  # No blacklist function for this example
+            priority_fn=None,   # No priority function for this example
+        )
+        
+        # Start the axon server
+        axon.start()
+        bt.logging.info(f"Axon server started on port {self.config.axon.port}")
+        
+        # Keep the miner running
+        try:
+            while True:
+                # Periodically update the metagraph
+                self.metagraph.sync()
+                bt.logging.info(f"Block: {self.metagraph.block.item()} | Miners: {len(self.metagraph.axons)}")
+                
+                # Sleep to prevent overwhelming the network
+                time.sleep(60)
+                
+        except KeyboardInterrupt:
+            bt.logging.info("Keyboard interrupt detected, exiting")
+        except Exception as e:
+            bt.logging.error(f"Error in miner loop: {e}")
+            traceback.print_exc()
+        finally:
+            # Stop the axon server
+            axon.stop()
+            bt.logging.info("Axon server stopped")
+
+    def process_stt_request(self, synapse: STTSynapse) -> STTSynapse:
+        """Process a speech-to-text request from a validator"""
+        bt.logging.info(f"Received STT request for job {synapse.job_id}")
+        
+        try:
+            # Record the start time for performance tracking
+            start_time = time.time()
+            
+            # Add the job to our database
+            self.add_job(synapse.job_id, synapse.base64_audio, synapse.gender)
+            
+            # Transcribe the audio
+            result = self.transcribe_audio(synapse.base64_audio)
+            
+            # Calculate processing time
+            processing_time = time.time() - start_time
+            
+            # Update the job in our database
+            self.update_job(
+                synapse.job_id,
+                result['transcript'],
+                result['language'],
+                result['gender'],
+                result['gender_confidence']
+            )
+            
+            # Fill in the response fields
+            synapse.transcript = result['transcript']
+            synapse.language_detected = result['language']
+            synapse.gender_detected = result['gender']
+            synapse.gender_confidence = result['gender_confidence']
+            synapse.processing_time = processing_time
+            
+            bt.logging.info(f"Completed STT request for job {synapse.job_id} in {processing_time:.2f}s")
+            
+        except Exception as e:
+            bt.logging.error(f"Error processing STT request: {e}")
+            traceback.print_exc()
+            synapse.error = str(e)
+        
+        return synapse
 
 if __name__ == "__main__":
     miner = STTMiner()
