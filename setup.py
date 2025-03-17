@@ -66,7 +66,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/Mukku27/message_subnet.git",
-    author="Tidal-flow",
+    author="Mukku27",
     packages=find_packages(),
     include_package_data=True,
     author_email="vemulapallimukesh@gmail.com",
