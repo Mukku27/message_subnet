@@ -23,6 +23,10 @@ class STTMiner:
         self.config = self.get_config()
         self.setup_logging()
         self.setup_bittensor_objects()
+        
+        # Job management - Initialize this BEFORE setup_job_database()
+        self.job_lock = threading.Lock()
+        
         self.setup_job_database()
         self.setup_whisper_model()
         
@@ -30,9 +34,6 @@ class STTMiner:
         self.my_subnet_uid = self.metagraph.hotkeys.index(
             self.wallet.hotkey.ss58_address
         )
-        
-        # Job management
-        self.job_lock = threading.Lock()
 
     def get_config(self):
         parser = argparse.ArgumentParser()
